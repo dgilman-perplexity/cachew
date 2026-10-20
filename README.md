@@ -591,30 +591,6 @@ Caching proxy for clients that use absolute-form HTTP requests (e.g. Android `sd
 proxy {}
 ```
 
-### Generic object metadata
-
-The object API is always enabled. Configure one `apiv1` strategy to restrict
-uploaded and returned metadata by namespace:
-
-```hcl
-strategy apiv1 {
-  namespace "service-impact" {
-    stored-headers = ["Content-Type"]
-  }
-}
-```
-
-Header names are case-insensitive. An empty list allows no caller metadata.
-Namespaces without an entry retain existing custom metadata behavior.
-`Authorization`, `Proxy-Authorization`, `Cookie`, and `Set-Cookie` are always
-excluded, and cannot be allowlisted. Policies also filter reads of older objects;
-they do not rewrite metadata already persisted in storage.
-
-ETags, byte lengths/ranges, and Cachew's absolute-expiration header are protocol
-metadata, separate from this allowlist. Upload length/range headers are discarded
-and calculated by the cache; TTL and explicit ETag inputs retain their existing
-validation and behavior. This configuration does not change request authentication.
-
 ## Cache Backends
 
 Multiple backends can be configured simultaneously — they are automatically combined into a tiered cache. Cache blocks

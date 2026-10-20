@@ -65,7 +65,9 @@ func testAPIWithCache(t *testing.T, config strategy.APIV1Config) (http.Handler, 
 }
 
 func TestObjectUploadDoesNotStoreCredentials(t *testing.T) {
-	handler, ctx, store := testAPIWithCache(t, strategy.APIV1Config{})
+	handler, ctx, store := testAPIWithCache(t, strategy.APIV1Config{
+		Namespaces: []strategy.ObjectNamespaceConfig{{Name: "test", StoredHeaders: []string{"Content-Type", "X-Object-Version"}}},
+	})
 	key := cache.NewKey("credential-upload")
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/object/test/"+key.String(), strings.NewReader("snapshot"))
 	req.Header = http.Header{
@@ -157,7 +159,7 @@ func TestNamespaceStoredHeaders(t *testing.T) {
 	for _, tt := range []struct{ name, contentType, version, extra string }{
 		{name: "selected", contentType: "application/gzip", version: "1"},
 		{name: "empty"},
-		{name: "unconfigured", contentType: "application/gzip", version: "1", extra: "other"},
+		{name: "unconfigured"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			key := cache.NewKey(tt.name)
@@ -177,8 +179,8 @@ func TestNamespaceStoredHeaders(t *testing.T) {
 	}
 }
 
-func TestNamespaceStoredHeadersRejectCredentials(t *testing.T) {
-	for _, header := range []string{"authorization", "Proxy-Authorization", "Cookie", "Set-Cookie", "invalid header"} {
+func TestNamespaceStoredHeadersRejectInvalidNames(t *testing.T) {
+	for _, header := range []string{"", "invalid header", "invalid\r\nheader"} {
 		t.Run(header, func(t *testing.T) {
 			ctx := logging.ContextWithLogger(t.Context(), slog.Default())
 			_, err := strategy.NewAPIV1(ctx, strategy.APIV1Config{

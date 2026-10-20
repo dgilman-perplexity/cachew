@@ -29,7 +29,12 @@ func TestRemoteCache(t *testing.T) {
 		t.Cleanup(func() { memCache.Close() })
 
 		mux := http.NewServeMux()
-		_, err = strategy.NewAPIV1(ctx, strategy.APIV1Config{}, memCache, mux)
+		_, err = strategy.NewAPIV1(ctx, strategy.APIV1Config{
+			Namespaces: []strategy.ObjectNamespaceConfig{{
+				Name:          "test",
+				StoredHeaders: []string{"Content-Type", "Cache-Control", "X-Custom-Field", "Last-Modified"},
+			}},
+		}, memCache, mux)
 		assert.NoError(t, err)
 		ts := httptest.NewServer(mux)
 		t.Cleanup(ts.Close)

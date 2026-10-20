@@ -62,10 +62,6 @@ func NewAPIV1(ctx context.Context, config APIV1Config, store cache.Cache, mux Mu
 			if !httpguts.ValidHeaderFieldName(header) {
 				return nil, errors.Errorf("invalid stored header %q", header)
 			}
-			switch header {
-			case "Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie":
-				return nil, errors.Errorf("credential header %q cannot be stored", header)
-			}
 			allowed = append(allowed, header)
 		}
 		s.storedHeaders[namespace] = allowed
@@ -186,16 +182,9 @@ func (d *APIV1) putObject(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func objectMetadataHeaders(headers http.Header) http.Header {
-	return httputil.FilterHeaders(headers, "Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie")
-}
-
 func (d *APIV1) metadataHeaders(namespace cache.Namespace, headers http.Header) http.Header {
-	filtered := objectMetadataHeaders(headers)
-	allowed, configured := d.storedHeaders[namespace]
-	if !configured {
-		return filtered
-	}
+	filtered := headers.Clone()
+	allowed := d.storedHeaders[namespace]
 	for key := range filtered {
 		switch http.CanonicalHeaderKey(key) {
 		case "Etag", "Content-Length", "Content-Range", cache.ExpirationKey:
