@@ -59,7 +59,7 @@ func (d *APIV1) statObject(w http.ResponseWriter, r *http.Request) {
 
 	namespacedCache := d.cache.Namespace(namespace)
 	headers, err := namespacedCache.Stat(r.Context(), key, httputil.ConditionalOptions(r)...)
-	if httputil.ServeCacheStat(w, headers, err) {
+	if httputil.ServeCacheStat(w, objectMetadataHeaders(headers), err) {
 		return
 	}
 	if errors.Is(err, os.ErrNotExist) {
@@ -83,7 +83,7 @@ func (d *APIV1) getObject(w http.ResponseWriter, r *http.Request) {
 
 	namespacedCache := d.cache.Namespace(namespace)
 	cr, headers, err := namespacedCache.Open(r.Context(), key, httputil.ConditionalOptions(r)...)
-	if handled, _, serveErr := httputil.ServeCacheHit(w, headers, cr, err); handled {
+	if handled, _, serveErr := httputil.ServeCacheHit(w, objectMetadataHeaders(headers), cr, err); handled {
 		if serveErr != nil {
 			d.logger.Error("Failed to serve cache object", "error", serveErr, "key", key)
 		}
@@ -119,7 +119,7 @@ func (d *APIV1) putObject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract and filter headers from request
-	headers := httputil.FilterHeaders(r.Header, httputil.TransportHeaders...)
+	headers := objectMetadataHeaders(httputil.FilterHeaders(r.Header, httputil.TransportHeaders...))
 	var opts []cache.Option
 	if etag := headers.Get(cache.ETagKey); etag != "" {
 		rawETag, err := cache.RawETagFromHeader(etag)
@@ -147,6 +147,10 @@ func (d *APIV1) putObject(w http.ResponseWriter, r *http.Request) {
 		d.httpError(w, http.StatusInternalServerError, err, "Failed to close cache writer")
 		return
 	}
+}
+
+func objectMetadataHeaders(headers http.Header) http.Header {
+	return httputil.FilterHeaders(headers, "Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie")
 }
 
 func (d *APIV1) deleteObject(w http.ResponseWriter, r *http.Request) {

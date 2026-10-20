@@ -47,6 +47,12 @@ func TestPutObjectAbortsOnReadError(t *testing.T) {
 
 func testAPISetup(t *testing.T) (http.Handler, context.Context) {
 	t.Helper()
+	handler, ctx, _ := testAPIWithCache(t)
+	return handler, ctx
+}
+
+func testAPIWithCache(t *testing.T) (http.Handler, context.Context, cache.Cache) {
+	t.Helper()
 	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
@@ -55,7 +61,86 @@ func testAPISetup(t *testing.T) (http.Handler, context.Context) {
 	mux := http.NewServeMux()
 	_, err = strategy.NewAPIV1(ctx, struct{}{}, memCache, mux)
 	assert.NoError(t, err)
-	return mux, ctx
+	return mux, ctx, memCache
+}
+
+func TestObjectUploadDoesNotStoreCredentials(t *testing.T) {
+	handler, ctx, store := testAPIWithCache(t)
+	key := cache.NewKey("credential-upload")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/object/test/"+key.String(), strings.NewReader("snapshot"))
+	req.Header = http.Header{
+		"authorization":       {"Bearer test-only-token"},
+		"Proxy-Authorization": {"Basic test-only-proxy"},
+		"Cookie":              {"session=test-only-cookie"},
+		"Set-Cookie":          {"session=test-only-cookie"},
+		"Content-Type":        {"application/gzip"},
+		"X-Object-Version":    {"1"},
+	}
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req.WithContext(ctx))
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "Bearer test-only-token", req.Header["authorization"][0]) //nolint:staticcheck // Verify filtering does not mutate noncanonical input headers.
+	body, headers, err := store.Namespace("test").Open(ctx, key)
+	assert.NoError(t, err)
+	defer body.Close()
+	data, err := io.ReadAll(body)
+	assert.NoError(t, err)
+	assert.Equal(t, "snapshot", string(data))
+	assert.Equal(t, "application/gzip", headers.Get("Content-Type"))
+	assert.Equal(t, "1", headers.Get("X-Object-Version"))
+	assertNoObjectCredentials(t, headers)
+}
+
+func assertNoObjectCredentials(t *testing.T, headers http.Header) {
+	t.Helper()
+	for key := range headers {
+		switch http.CanonicalHeaderKey(key) {
+		case "Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie":
+			t.Errorf("credential header returned: %s", key)
+		}
+	}
+}
+
+func TestObjectReadsStripLegacyCredentials(t *testing.T) {
+	handler, ctx, store := testAPIWithCache(t)
+	key := cache.NewKey("legacy-credentials")
+	writer, err := store.Namespace("test").Create(ctx, key, http.Header{
+		"authorization":       {"Bearer test-only-token"},
+		"Proxy-Authorization": {"Basic test-only-proxy"},
+		"Cookie":              {"session=test-only-cookie"},
+		"Set-Cookie":          {"session=test-only-cookie"},
+		"Content-Type":        {"application/gzip"},
+	}, time.Hour, cache.WithETag("legacy"))
+	assert.NoError(t, err)
+	_, err = io.WriteString(writer, "snapshot")
+	assert.NoError(t, err)
+	assert.NoError(t, writer.Close())
+
+	for _, tt := range []struct {
+		name, method, header, value, body string
+		status                            int
+	}{
+		{name: "Get", method: http.MethodGet, status: http.StatusOK, body: "snapshot"},
+		{name: "Head", method: http.MethodHead, status: http.StatusOK},
+		{name: "ConditionalGet", method: http.MethodGet, header: "If-None-Match", value: `"legacy"`, status: http.StatusNotModified},
+		{name: "ConditionalHead", method: http.MethodHead, header: "If-None-Match", value: `"legacy"`, status: http.StatusNotModified},
+		{name: "Range", method: http.MethodGet, header: "Range", value: "bytes=0-3", status: http.StatusPartialContent, body: "snap"},
+		{name: "UnsatisfiableRange", method: http.MethodGet, header: "Range", value: "bytes=99-", status: http.StatusRequestedRangeNotSatisfiable},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, "/api/v1/object/test/"+key.String(), nil)
+			if tt.header != "" {
+				req.Header.Set(tt.header, tt.value)
+			}
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req.WithContext(ctx))
+			assert.Equal(t, tt.status, w.Code)
+			assert.Equal(t, tt.body, w.Body.String())
+			assert.Equal(t, `"legacy"`, w.Header().Get("ETag"))
+			assert.Equal(t, "application/gzip", w.Header().Get("Content-Type"))
+			assertNoObjectCredentials(t, w.Header())
+		})
+	}
 }
 
 func apiPut(ctx context.Context, t *testing.T, handler http.Handler, key cache.Key) string {
