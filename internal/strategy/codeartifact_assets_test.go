@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/alecthomas/assert/v2"
+	"github.com/alecthomas/errors"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awscodeartifact "github.com/aws/aws-sdk-go-v2/service/codeartifact"
@@ -19,11 +20,12 @@ import (
 
 func TestCodeArtifactAssetAPI(t *testing.T) {
 	calls := 0
+	wantDomain := "example"
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		assert.Equal(t, "/v1/package/version/asset", r.URL.Path)
 		assert.Equal(t, http.MethodGet, r.Method)
-		assert.Equal(t, "example", r.URL.Query().Get("domain"))
+		assert.Equal(t, wantDomain, r.URL.Query().Get("domain"))
 		assert.Equal(t, "123456789012", r.URL.Query().Get("domain-owner"))
 		assert.Equal(t, "packages", r.URL.Query().Get("repository"))
 		assert.Equal(t, "org.example", r.URL.Query().Get("namespace"))
@@ -41,6 +43,9 @@ func TestCodeArtifactAssetAPI(t *testing.T) {
 			w.Header().Set("X-Amzn-Errortype", "AccessDeniedException")
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = w.Write([]byte(`{"message":"private origin detail"}`))
+		case "truncated.tar":
+			w.Header().Set("Content-Length", "7")
+			_, _ = w.Write([]byte("bad"))
 		default:
 			w.Header().Set("X-Packageversionrevision", "revision-1")
 			w.Header().Set("Content-Length", "7")
@@ -111,4 +116,73 @@ func TestCodeArtifactAssetAPI(t *testing.T) {
 	mux.ServeHTTP(snapshot, httptest.NewRequest(http.MethodGet, "/downloads/1-SNAPSHOT/tool.tar", nil))
 	assert.Equal(t, 404, snapshot.Code)
 	assert.Equal(t, 9, calls)
+	wantDomain = "another"
+	otherMux := http.NewServeMux()
+	config.Domain = wantDomain
+	other, err := newCodeArtifact(ctx, config, otherMux, nil, memory, true)
+	assert.NoError(t, err)
+	other.assets = &codeArtifactAssetOrigin{client: strategy.assets.client, domain: wantDomain, owner: config.DomainOwner}
+	otherResponse := httptest.NewRecorder()
+	otherMux.ServeHTTP(otherResponse, httptest.NewRequest(http.MethodGet, "/downloads/1/tool.tar", nil))
+	assert.Equal(t, http.StatusOK, otherResponse.Code)
+	assert.Equal(t, 10, calls)
+	wantDomain = "example"
+	for range 2 {
+		assert.Equal(t, "bad", request("GET", "truncated.tar", nil).Body.String())
+	}
+	assert.Equal(t, 12, calls)
+}
+
+func TestCodeArtifactAssetConfiguration(t *testing.T) {
+	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	for _, tc := range []struct {
+		name      string
+		configure func(*CodeArtifactConfig)
+		valid     bool
+	}{
+		{"no metadata rewrite URL", func(c *CodeArtifactConfig) { c.ProxyBaseURL = "" }, true},
+		{"repository still requires rewrite URL", func(c *CodeArtifactConfig) { c.AssetAPI = false; c.ProxyBaseURL = "" }, false},
+		{"requires aliases only", func(c *CodeArtifactConfig) { c.AliasesOnly = false }, false},
+		{"requires aliases", func(c *CodeArtifactConfig) { c.Aliases = nil }, false},
+		{"rejects npm", func(c *CodeArtifactConfig) { c.Aliases[0].Path = "/npm/packages/{version}/{asset}" }, false},
+		{"rejects incomplete Maven path", func(c *CodeArtifactConfig) { c.Aliases[0].Path = "/maven/packages/{version}/{asset}" }, false},
+		{"rejects static snapshot", func(c *CodeArtifactConfig) { c.Aliases[0].Path = "/maven/packages/org/tool/1-SNAPSHOT/{asset}" }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := testCodeArtifactConfig("https://codeartifact.example.com")
+			config.AssetAPI, config.AliasesOnly = true, true
+			config.Aliases = []CodeArtifactAliasConfig{{Pattern: "/downloads/{version}/{asset}", Path: "/maven/packages/org/example/tool/{version}/{asset}"}}
+			tc.configure(&config)
+			_, err := newCodeArtifact(ctx, config, http.NewServeMux(), nil, cache.NoOpCache(), false)
+			if tc.valid {
+				assert.NoError(t, err)
+			} else {
+				assert.Error(t, err)
+			}
+		})
+	}
+}
+
+func TestCodeArtifactAssetCredentialDeadline(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "fixture")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "fixture")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_MAX_ATTEMPTS", "100")
+	sts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/xml")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`<ErrorResponse><Error><Code>ServiceUnavailable</Code></Error></ErrorResponse>`))
+	}))
+	defer sts.Close()
+	t.Setenv("AWS_ENDPOINT_URL_STS", sts.URL)
+	config := testCodeArtifactConfig("https://codeartifact.example.com")
+	config.AssetAPI = true
+	config.CredentialTimeout = 10 * time.Millisecond
+	client, err := newCodeArtifactClient(t.Context(), config)
+	assert.NoError(t, err)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	_, err = client.Options().Credentials.Retrieve(ctx)
+	assert.True(t, errors.Is(err, context.DeadlineExceeded))
+	assert.NoError(t, ctx.Err(), "credential timeout must include STS retries, before the caller deadline")
 }

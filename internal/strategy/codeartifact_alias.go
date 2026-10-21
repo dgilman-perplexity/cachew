@@ -69,6 +69,11 @@ func (c *CodeArtifact) registerAliases(config CodeArtifactConfig, mux Mux) (err 
 		if err != nil {
 			return err
 		}
+		if config.AssetAPI {
+			if _, err := codeArtifactMavenAsset(aliasSubstitution.ReplaceAllString(alias.Path, "value")); err != nil {
+				return errors.Wrap(err, "codeartifact: invalid asset-api alias target")
+			}
+		}
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.RawQuery != "" || r.URL.ForceQuery || r.URL.RawPath != "" || path.Clean(r.URL.Path) != r.URL.Path {
 				http.NotFound(w, r)

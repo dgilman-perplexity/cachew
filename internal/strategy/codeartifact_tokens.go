@@ -2,7 +2,6 @@ package strategy
 
 import (
 	"context"
-	"net/http"
 	"sync"
 	"time"
 
@@ -63,14 +62,27 @@ func newCodeArtifactClient(ctx context.Context, config CodeArtifactConfig) (*aws
 	if err != nil {
 		return nil, errors.Wrap(err, "load AWS configuration for CodeArtifact")
 	}
-	stsClient := sts.NewFromConfig(awsConfig, func(options *sts.Options) {
-		if config.AssetAPI {
-			options.HTTPClient = &http.Client{Timeout: config.CredentialTimeout}
-		}
-	})
-	awsConfig.Credentials = aws.NewCredentialsCache(stscreds.NewAssumeRoleProvider(stsClient, config.RoleARN))
+	stsClient := sts.NewFromConfig(awsConfig)
+	var provider aws.CredentialsProvider = stscreds.NewAssumeRoleProvider(stsClient, config.RoleARN)
+	if config.AssetAPI {
+		provider = codeArtifactCredentialDeadline(provider, config.CredentialTimeout)
+	}
+	awsConfig.Credentials = aws.NewCredentialsCache(provider)
+	if config.AssetAPI {
+		// The SDK detaches shared refreshes from caller cancellation. Bound both
+		// the refresh (including retries) and each caller waiting for it.
+		awsConfig.Credentials = codeArtifactCredentialDeadline(awsConfig.Credentials, config.CredentialTimeout)
+	}
 
 	return awscodeartifact.NewFromConfig(awsConfig), nil
+}
+
+func codeArtifactCredentialDeadline(provider aws.CredentialsProvider, timeout time.Duration) aws.CredentialsProvider {
+	return aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		return provider.Retrieve(ctx)
+	})
 }
 
 func newCodeArtifactTokenManagerWithClient(

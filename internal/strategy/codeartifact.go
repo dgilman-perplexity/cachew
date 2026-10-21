@@ -38,7 +38,7 @@ type CodeArtifactConfig struct {
 	AliasesOnly           bool                      `hcl:"aliases-only,optional" help:"Disable the origin-prefixed route; requires at least one alias."`
 	ImmutableFallbackTTL  time.Duration             `hcl:"immutable-fallback-ttl,optional" help:"Opt-in freshness for public immutable responses without origin freshness. Zero disables; maximum 24h."`
 	Target                string                    `hcl:"target,label" help:"The CodeArtifact origin URL to proxy requests to."`
-	ProxyBaseURL          string                    `hcl:"proxy-base-url" help:"The public Cachew origin used when rewriting package metadata URLs."`
+	ProxyBaseURL          string                    `hcl:"proxy-base-url,optional" help:"The public Cachew origin used when rewriting package metadata URLs. Required unless asset-api is enabled."`
 	Domain                string                    `hcl:"domain" help:"The CodeArtifact domain name."`
 	DomainOwner           string                    `hcl:"domain-owner" help:"The AWS account ID that owns the CodeArtifact domain."`
 	Region                string                    `hcl:"region" help:"The AWS region containing the CodeArtifact domain."`
@@ -217,11 +217,13 @@ func validateCodeArtifactConfig(config CodeArtifactConfig, allowHTTP bool) (*url
 		value string
 	}{
 		{name: "target", value: config.Target},
-		{name: "proxy-base-url", value: config.ProxyBaseURL},
 		{name: "domain", value: config.Domain},
 		{name: "domain-owner", value: config.DomainOwner},
 		{name: "region", value: config.Region},
 		{name: "role-arn", value: config.RoleARN},
+	}
+	if !config.AssetAPI {
+		configured = append(configured, struct{ name, value string }{name: "proxy-base-url", value: config.ProxyBaseURL})
 	}
 	for _, field := range configured {
 		if field.value == "" {
@@ -236,9 +238,12 @@ func validateCodeArtifactConfig(config CodeArtifactConfig, allowHTTP bool) (*url
 	if err != nil {
 		return nil, nil, err
 	}
-	proxyBase, err := parseCodeArtifactOrigin("proxy-base-url", config.ProxyBaseURL, allowHTTP)
-	if err != nil {
-		return nil, nil, err
+	var proxyBase *url.URL
+	if config.ProxyBaseURL != "" {
+		proxyBase, err = parseCodeArtifactOrigin("proxy-base-url", config.ProxyBaseURL, allowHTTP)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	return target, proxyBase, nil
 }

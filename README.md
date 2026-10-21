@@ -215,6 +215,9 @@ shape, but cold reads use the signed `GetPackageVersionAsset` API. Grant only
 read and token permissions are unnecessary. IAM limits packages, while the
 admission policy must restrict versions and asset names. This mode does not serve
 repository metadata, mutable `-SNAPSHOT` versions or other package formats.
+Unsupported alias targets fail at startup. `proxy-base-url` can be omitted in
+this mode because assets require no metadata URL rewriting. The SDK uses `domain`,
+`domain-owner` and `region` to select the AWS origin; cache keys include that identity.
 
 Asset reads use a separate `codeartifact-assets` cache namespace and the existing
 `immutable-fallback-ttl` setting. Successful asset responses are treated as immutable;

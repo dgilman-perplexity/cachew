@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,37 +25,33 @@ type codeArtifactAssetOrigin struct {
 
 func (c *CodeArtifact) serveAsset(w http.ResponseWriter, r *http.Request, mode codeArtifactCacheMode) {
 	origin := c.originURL(r)
-	parts := strings.Split(strings.TrimPrefix(origin.Path, "/"), "/")
-	if len(parts) < 6 || parts[0] != "maven" || origin.RawQuery != "" || origin.RawPath != "" {
+	input, err := codeArtifactMavenAsset(origin.Path)
+	if err != nil || origin.RawQuery != "" || origin.RawPath != "" {
 		http.NotFound(w, r)
 		return
 	}
-	for i, part := range parts {
-		if !aliasSegment.MatchString(part) || part == "." || part == ".." || (i == len(parts)-2 && strings.HasSuffix(part, "-SNAPSHOT")) {
-			http.NotFound(w, r)
-			return
-		}
-	}
-	n := len(parts)
+	input.Domain, input.DomainOwner = aws.String(c.assets.domain), aws.String(c.assets.owner)
 	ctx, cancel := context.WithCancelCause(r.Context())
 	defer cancel(nil)
 	started := time.Now()
-	output, err := c.assets.client.GetPackageVersionAsset(ctx, &awscodeartifact.GetPackageVersionAssetInput{
-		Domain: aws.String(c.assets.domain), DomainOwner: aws.String(c.assets.owner),
-		Repository: aws.String(parts[1]), Format: types.PackageFormatMaven,
-		Namespace: aws.String(strings.Join(parts[2:n-3], ".")), Package: aws.String(parts[n-3]),
-		PackageVersion: aws.String(parts[n-2]), Asset: aws.String(parts[n-1]),
-	})
+	output, err := c.assets.client.GetPackageVersionAsset(ctx, input)
 	if err != nil {
+		status := codeArtifactTransportStatus(ctx, err)
 		var responseError *smithyhttp.ResponseError
 		if errors.As(err, &responseError) {
+			status = strconv.Itoa(responseError.HTTPStatusCode())
+		}
+		c.metric.recordOrigin(context.WithoutCancel(ctx), codeArtifactOriginObservation{
+			status: status, format: "maven", duration: time.Since(started),
+		})
+		if responseError != nil {
 			switch responseError.HTTPStatusCode() {
 			case http.StatusNotFound, http.StatusForbidden, http.StatusTooManyRequests:
 				http.Error(w, "CodeArtifact asset unavailable", responseError.HTTPStatusCode())
 				return
 			}
 		}
-		c.writeError(w, r, errors.New("request CodeArtifact asset"))
+		c.writeError(w, r, errors.Errorf("request CodeArtifact asset: %s", status))
 		return
 	}
 	body := newCodeArtifactOriginBody(ctx, output.Asset, cancel, c.originReadIdleTimeout)
@@ -95,4 +92,22 @@ func (c *CodeArtifact) serveAsset(w http.ResponseWriter, r *http.Request, mode c
 	} else {
 		c.streamOriginBody(r.Context(), w, resp.Body)
 	}
+}
+
+func codeArtifactMavenAsset(path string) (*awscodeartifact.GetPackageVersionAssetInput, error) {
+	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	n := len(parts)
+	if n < 6 || parts[0] != "maven" || strings.HasSuffix(parts[n-2], "-SNAPSHOT") {
+		return nil, errors.New("expected a non-snapshot Maven asset path")
+	}
+	for _, part := range parts {
+		if !aliasSegment.MatchString(part) || part == "." || part == ".." {
+			return nil, errors.New("invalid Maven asset path segment")
+		}
+	}
+	return &awscodeartifact.GetPackageVersionAssetInput{
+		Repository: aws.String(parts[1]), Format: types.PackageFormatMaven,
+		Namespace: aws.String(strings.Join(parts[2:n-3], ".")), Package: aws.String(parts[n-3]),
+		PackageVersion: aws.String(parts[n-2]), Asset: aws.String(parts[n-1]),
+	}, nil
 }
