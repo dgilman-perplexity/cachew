@@ -57,7 +57,7 @@ func TestCodeArtifactAssetAPI(t *testing.T) {
 	config.AssetAPI = true
 	config.AliasesOnly = true
 	config.ImmutableFallbackTTL = time.Hour
-	config.Aliases = []CodeArtifactAliasConfig{{Pattern: "/downloads/{asset}", Path: "/maven/packages/org/example/tool/1/{asset}"}}
+	config.Aliases = []CodeArtifactAliasConfig{{Pattern: "/downloads/{version}/{asset}", Path: "/maven/packages/org/example/tool/{version}/{asset}"}}
 	mux := http.NewServeMux()
 	strategy, err := newCodeArtifact(ctx, config, mux, nil, memory, true)
 	assert.NoError(t, err)
@@ -68,7 +68,7 @@ func TestCodeArtifactAssetAPI(t *testing.T) {
 		}, func(o *awscodeartifact.Options) { o.BaseEndpoint = aws.String(origin.URL); o.RetryMaxAttempts = 1 }),
 	}
 	request := func(method, asset string, headers map[string]string) *httptest.ResponseRecorder {
-		r := httptest.NewRequest(method, "/downloads/"+asset, nil)
+		r := httptest.NewRequest(method, "/downloads/1/"+asset, nil)
 		r.Header.Set("Authorization", "Bearer caller")
 		for name, value := range headers {
 			r.Header.Set(name, value)
@@ -88,10 +88,10 @@ func TestCodeArtifactAssetAPI(t *testing.T) {
 	assert.Equal(t, 304, request("GET", "tool.tar", map[string]string{"If-None-Match": etag}).Code)
 	assert.Equal(t, 412, request("GET", "tool.tar", map[string]string{"If-Match": `"other"`}).Code)
 	assert.Equal(t, 1, calls)
-	for _, asset := range []string{"missing.tar", "denied.tar"} {
+	for asset, status := range map[string]int{"missing.tar": http.StatusNotFound, "denied.tar": http.StatusForbidden} {
 		for range 2 {
 			response := request("GET", asset, nil)
-			assert.True(t, response.Code == 404 || response.Code == 403)
+			assert.Equal(t, status, response.Code)
 			assert.Equal(t, "CodeArtifact asset unavailable\n", response.Body.String())
 		}
 	}
@@ -106,5 +106,9 @@ func TestCodeArtifactAssetAPI(t *testing.T) {
 	assert.Equal(t, "archive", ranged.Body.String())
 	assert.Equal(t, 8, calls)
 	assert.Equal(t, "archive", request("GET", "cold.tar", nil).Body.String())
+	assert.Equal(t, 9, calls)
+	snapshot := httptest.NewRecorder()
+	mux.ServeHTTP(snapshot, httptest.NewRequest(http.MethodGet, "/downloads/1-SNAPSHOT/tool.tar", nil))
+	assert.Equal(t, 404, snapshot.Code)
 	assert.Equal(t, 9, calls)
 }

@@ -29,8 +29,8 @@ func (c *CodeArtifact) serveAsset(w http.ResponseWriter, r *http.Request, mode c
 		http.NotFound(w, r)
 		return
 	}
-	for _, part := range parts {
-		if !aliasSegment.MatchString(part) || part == "." || part == ".." {
+	for i, part := range parts {
+		if !aliasSegment.MatchString(part) || part == "." || part == ".." || (i == len(parts)-2 && strings.HasSuffix(part, "-SNAPSHOT")) {
 			http.NotFound(w, r)
 			return
 		}

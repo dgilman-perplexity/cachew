@@ -214,7 +214,7 @@ shape, but cold reads use the signed `GetPackageVersionAsset` API. Grant only
 `codeartifact:GetPackageVersionAsset` on the required package ARNs; repository
 read and token permissions are unnecessary. IAM limits packages, while the
 admission policy must restrict versions and asset names. This mode does not serve
-repository metadata or other package formats.
+repository metadata, mutable `-SNAPSHOT` versions or other package formats.
 
 Asset reads use a separate `codeartifact-assets` cache namespace and the existing
 `immutable-fallback-ttl` setting. Successful asset responses are treated as immutable;
