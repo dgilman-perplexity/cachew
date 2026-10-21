@@ -208,6 +208,20 @@ The role needs `codeartifact:GetAuthorizationToken` and its underlying principal
 needs `sts:GetServiceBearerToken`. Repository read permissions remain governed by
 the CodeArtifact resource policy.
 
+For a Maven asset download service, opt into `asset-api = true` together with
+`aliases-only = true`. Alias targets retain their `/maven/<repository>/<group>/<package>/<version>/<asset>`
+shape, but cold reads use the signed `GetPackageVersionAsset` API. Grant only
+`codeartifact:GetPackageVersionAsset` on the required package ARNs; repository
+read and token permissions are unnecessary. IAM limits packages, while the
+admission policy must restrict versions and asset names. This mode does not serve
+repository metadata or other package formats.
+
+Asset reads use a separate `codeartifact-assets` cache namespace and the existing
+`immutable-fallback-ttl` setting. Successful asset responses are treated as immutable;
+source deletion or permission revocation does not evict cached bytes. Admission still
+runs before cache lookup. GET, HEAD and ETag conditions are supported; Range requests
+receive a complete 200 response because the asset API has no range operation.
+
 Credential refresh, including time spent waiting for another required refresh,
 has a whole-operation deadline. The origin header deadline begins after the
 request is written; dial and TLS setup retain the HTTP transport's own bounds.

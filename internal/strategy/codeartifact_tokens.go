@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"context"
+	"net/http"
 	"sync"
 	"time"
 
@@ -55,17 +56,21 @@ type codeArtifactToken struct {
 	event      codeArtifactAuthEvent
 }
 
-func newCodeArtifactTokenManager(ctx context.Context, config CodeArtifactConfig) (*codeArtifactTokenManager, error) {
+func newCodeArtifactClient(ctx context.Context, config CodeArtifactConfig) (*awscodeartifact.Client, error) {
 	loadCtx, cancel := context.WithTimeout(ctx, config.CredentialTimeout)
 	defer cancel()
 	awsConfig, err := awsconfig.LoadDefaultConfig(loadCtx, awsconfig.WithRegion(config.Region))
 	if err != nil {
 		return nil, errors.Wrap(err, "load AWS configuration for CodeArtifact")
 	}
-	stsClient := sts.NewFromConfig(awsConfig)
+	stsClient := sts.NewFromConfig(awsConfig, func(options *sts.Options) {
+		if config.AssetAPI {
+			options.HTTPClient = &http.Client{Timeout: config.CredentialTimeout}
+		}
+	})
 	awsConfig.Credentials = aws.NewCredentialsCache(stscreds.NewAssumeRoleProvider(stsClient, config.RoleARN))
 
-	return newCodeArtifactTokenManagerWithClient(config, awscodeartifact.NewFromConfig(awsConfig), time.Now), nil
+	return awscodeartifact.NewFromConfig(awsConfig), nil
 }
 
 func newCodeArtifactTokenManagerWithClient(

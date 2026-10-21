@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/alecthomas/errors"
+	awscodeartifact "github.com/aws/aws-sdk-go-v2/service/codeartifact"
 	"github.com/felixge/httpsnoop"
 
 	"github.com/block/cachew/internal/cache"
@@ -32,6 +33,7 @@ const (
 
 // CodeArtifactConfig configures an authenticated, read-only CodeArtifact origin.
 type CodeArtifactConfig struct {
+	AssetAPI              bool                      `hcl:"asset-api,optional" help:"Read Maven assets through GetPackageVersionAsset for package-scoped IAM. Requires aliases-only; range requests return the complete asset."`
 	Aliases               []CodeArtifactAliasConfig `hcl:"alias,block" help:"Optional local download routes mapped to fixed-origin paths."`
 	AliasesOnly           bool                      `hcl:"aliases-only,optional" help:"Disable the origin-prefixed route; requires at least one alias."`
 	ImmutableFallbackTTL  time.Duration             `hcl:"immutable-fallback-ttl,optional" help:"Opt-in freshness for public immutable responses without origin freshness. Zero disables; maximum 24h."`
@@ -50,6 +52,7 @@ type CodeArtifactConfig struct {
 // CodeArtifact caches origin-declared immutable responses and passes all other
 // authenticated reads through.
 type CodeArtifact struct {
+	assets                *codeArtifactAssetOrigin
 	immutableFallbackTTL  time.Duration
 	target                *url.URL
 	proxyBase             *url.URL
@@ -87,13 +90,22 @@ func NewCodeArtifact(ctx context.Context, config CodeArtifactConfig, configuredC
 	if _, _, err := validateCodeArtifactConfig(config, false); err != nil {
 		return nil, err
 	}
-	tokens, err := newCodeArtifactTokenManager(ctx, config)
+	client, err := newCodeArtifactClient(ctx, config)
 	if err != nil {
 		return nil, err
+	}
+	var tokens codeArtifactTokenSource
+	if !config.AssetAPI {
+		tokens = newCodeArtifactTokenManagerWithClient(config, client, time.Now)
 	}
 	strategy, err := newCodeArtifact(ctx, config, mux, tokens, configuredCache, false)
 	if err != nil {
 		return nil, err
+	}
+	if config.AssetAPI {
+		options := client.Options()
+		options.HTTPClient = strategy.client
+		strategy.assets = &codeArtifactAssetOrigin{client: awscodeartifact.New(options), domain: config.Domain, owner: config.DomainOwner}
 	}
 	if config.PackagePolicy != nil {
 		strategy.packagePolicy, err = packagepolicy.New(*config.PackagePolicy)
@@ -122,12 +134,16 @@ func newCodeArtifact(
 	transport.DisableCompression = true
 	transport.ResponseHeaderTimeout = config.OriginHeaderTimeout
 
+	namespace := cache.Namespace("codeartifact")
+	if config.AssetAPI {
+		namespace = "codeartifact-assets"
+	}
 	c := &CodeArtifact{
 		target:    target,
 		proxyBase: proxyBase,
 		prefix:    "/" + target.Host,
 		tokens:    tokens,
-		cache:     configuredCache.Namespace(cache.Namespace("codeartifact")),
+		cache:     configuredCache.Namespace(namespace),
 		client: &http.Client{
 			Transport: transport,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -175,6 +191,9 @@ func codeArtifactConfigWithDefaults(config CodeArtifactConfig) CodeArtifactConfi
 }
 
 func validateCodeArtifactConfig(config CodeArtifactConfig, allowHTTP bool) (*url.URL, *url.URL, error) {
+	if config.AssetAPI && (!config.AliasesOnly || config.PackagePolicy != nil) {
+		return nil, nil, errors.New("codeartifact: asset-api requires aliases-only and does not support package-policy")
+	}
 	if config.ImmutableFallbackTTL < 0 || config.ImmutableFallbackTTL > 24*time.Hour || (config.ImmutableFallbackTTL > 0 && config.ImmutableFallbackTTL < time.Second) {
 		return nil, nil, errors.New("codeartifact: immutable-fallback-ttl must be zero or between 1s and 24h")
 	}
@@ -295,6 +314,14 @@ func (c *CodeArtifact) servePackage(w http.ResponseWriter, r *http.Request, deci
 }
 
 func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode codeArtifactCacheMode) {
+	if c.assets != nil {
+		c.serveAsset(w, r, mode)
+	} else {
+		c.serveRepository(w, r, mode)
+	}
+}
+
+func (c *CodeArtifact) serveRepository(w http.ResponseWriter, r *http.Request, mode codeArtifactCacheMode) {
 	rewriteMetadata := shouldRewriteCodeArtifactMetadata(c.originURL(r).Path)
 	token, err := c.authorizationToken(r.Context())
 	if err != nil {
