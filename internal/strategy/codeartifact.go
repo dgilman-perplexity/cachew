@@ -33,12 +33,11 @@ const (
 
 // CodeArtifactConfig configures an authenticated, read-only CodeArtifact origin.
 type CodeArtifactConfig struct {
-	AssetAPI              bool                      `hcl:"asset-api,optional" help:"Read Maven assets through GetPackageVersionAsset for package-scoped IAM. Requires aliases-only; range requests return the complete asset."`
-	Aliases               []CodeArtifactAliasConfig `hcl:"alias,block" help:"Optional local download routes mapped to fixed-origin paths."`
-	AliasesOnly           bool                      `hcl:"aliases-only,optional" help:"Disable the origin-prefixed route; requires at least one alias."`
+	AssetAPI              bool                      `hcl:"asset-api,optional" help:"Read Maven assets through GetPackageVersionAsset for package-scoped IAM. Serves only configured aliases; range requests return the complete asset."`
+	Aliases               []CodeArtifactAliasConfig `hcl:"alias,block" help:"Maven asset download routes; requires asset-api."`
 	ImmutableFallbackTTL  time.Duration             `hcl:"immutable-fallback-ttl,optional" help:"Opt-in freshness for public immutable responses without origin freshness. Zero disables; maximum 24h."`
 	Target                string                    `hcl:"target,label" help:"The CodeArtifact origin URL to proxy requests to."`
-	ProxyBaseURL          string                    `hcl:"proxy-base-url,optional" help:"The public Cachew origin used when rewriting package metadata URLs. Required unless asset-api is enabled."`
+	ProxyBaseURL          string                    `hcl:"proxy-base-url,optional" help:"The public Cachew origin used when rewriting package metadata URLs. Required for repository proxying; unsupported with asset-api."`
 	Domain                string                    `hcl:"domain" help:"The CodeArtifact domain name."`
 	DomainOwner           string                    `hcl:"domain-owner" help:"The AWS account ID that owns the CodeArtifact domain."`
 	Region                string                    `hcl:"region" help:"The AWS region containing the CodeArtifact domain."`
@@ -163,7 +162,7 @@ func newCodeArtifact(
 		}
 	}
 
-	if !config.AliasesOnly {
+	if !config.AssetAPI {
 		for _, method := range []string{http.MethodGet, http.MethodHead} {
 			pattern := method + " " + c.prefix + "/"
 			mux.Handle(pattern, c)
@@ -191,8 +190,12 @@ func codeArtifactConfigWithDefaults(config CodeArtifactConfig) CodeArtifactConfi
 }
 
 func validateCodeArtifactConfig(config CodeArtifactConfig, allowHTTP bool) (*url.URL, *url.URL, error) {
-	if config.AssetAPI && (!config.AliasesOnly || config.PackagePolicy != nil) {
-		return nil, nil, errors.New("codeartifact: asset-api requires aliases-only and does not support package-policy")
+	if config.AssetAPI {
+		if len(config.Aliases) == 0 || config.PackagePolicy != nil || config.ProxyBaseURL != "" {
+			return nil, nil, errors.New("codeartifact: asset-api requires aliases and does not support package-policy or proxy-base-url")
+		}
+	} else if len(config.Aliases) != 0 {
+		return nil, nil, errors.New("codeartifact: aliases require asset-api")
 	}
 	if config.ImmutableFallbackTTL < 0 || config.ImmutableFallbackTTL > 24*time.Hour || (config.ImmutableFallbackTTL > 0 && config.ImmutableFallbackTTL < time.Second) {
 		return nil, nil, errors.New("codeartifact: immutable-fallback-ttl must be zero or between 1s and 24h")

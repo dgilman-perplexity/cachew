@@ -16,6 +16,7 @@ import (
 
 	"github.com/block/cachew/internal/cache"
 	"github.com/block/cachew/internal/logging"
+	"github.com/block/cachew/internal/opa"
 )
 
 func TestCodeArtifactAssetAPI(t *testing.T) {
@@ -60,7 +61,7 @@ func TestCodeArtifactAssetAPI(t *testing.T) {
 	defer memory.Close()
 	config := testCodeArtifactConfig(origin.URL)
 	config.AssetAPI = true
-	config.AliasesOnly = true
+	config.ProxyBaseURL = ""
 	config.ImmutableFallbackTTL = time.Hour
 	config.Aliases = []CodeArtifactAliasConfig{{Pattern: "/downloads/{version}/{asset}", Path: "/maven/packages/org/example/tool/{version}/{asset}"}}
 	mux := http.NewServeMux()
@@ -72,14 +73,22 @@ func TestCodeArtifactAssetAPI(t *testing.T) {
 			Region: "us-east-1", Credentials: credentials.NewStaticCredentialsProvider("fixture", "fixture", ""),
 		}, func(o *awscodeartifact.Options) { o.BaseEndpoint = aws.String(origin.URL); o.RetryMaxAttempts = 1 }),
 	}
+	handler, err := opa.Middleware(ctx, opa.Config{Policy: `package cachew.authz
+default allow := false
+allow if { input.headers["authorization"] == "Bearer caller" }
+`}, mux)
+	assert.NoError(t, err)
 	request := func(method, asset string, headers map[string]string) *httptest.ResponseRecorder {
-		r := httptest.NewRequest(method, "/downloads/1/"+asset, nil)
+		r := httptest.NewRequest(method, "/downloads/1/"+asset, nil).WithContext(ctx)
 		r.Header.Set("Authorization", "Bearer caller")
 		for name, value := range headers {
 			r.Header.Set(name, value)
 		}
 		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, r)
+		denied := httptest.NewRecorder()
+		handler.ServeHTTP(denied, httptest.NewRequest(http.MethodGet, "/downloads/1/tool.tar", nil).WithContext(ctx))
+		assert.Equal(t, http.StatusForbidden, denied.Code)
+		handler.ServeHTTP(w, r)
 		return w
 	}
 	first := request("GET", "tool.tar", nil)
@@ -116,6 +125,17 @@ func TestCodeArtifactAssetAPI(t *testing.T) {
 	mux.ServeHTTP(snapshot, httptest.NewRequest(http.MethodGet, "/downloads/1-SNAPSHOT/tool.tar", nil))
 	assert.Equal(t, 404, snapshot.Code)
 	assert.Equal(t, 9, calls)
+	for _, path := range []string{
+		"/downloads/1/tool.tar?token=value", "/downloads/1/tool.tar?",
+		"/downloads/1/%2e%2e", "/downloads/1/%61bc", "/downloads/1/a%2fb", "/downloads/1/a%25b",
+		codeArtifactPath(origin, "/maven/packages/org/example/tool/1/tool.tar"),
+	} {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		assert.Equal(t, http.StatusNotFound, w.Code, "path=%s", path)
+	}
+	assert.Equal(t, http.StatusMethodNotAllowed, request(http.MethodPost, "tool.tar", nil).Code)
+	assert.Equal(t, 9, calls)
 	wantDomain = "another"
 	otherMux := http.NewServeMux()
 	config.Domain = wantDomain
@@ -123,7 +143,7 @@ func TestCodeArtifactAssetAPI(t *testing.T) {
 	assert.NoError(t, err)
 	other.assets = &codeArtifactAssetOrigin{client: strategy.assets.client, domain: wantDomain, owner: config.DomainOwner}
 	otherResponse := httptest.NewRecorder()
-	otherMux.ServeHTTP(otherResponse, httptest.NewRequest(http.MethodGet, "/downloads/1/tool.tar", nil))
+	otherMux.ServeHTTP(otherResponse, httptest.NewRequest(http.MethodGet, "/downloads/1/tool.tar", nil).WithContext(ctx))
 	assert.Equal(t, http.StatusOK, otherResponse.Code)
 	assert.Equal(t, 10, calls)
 	wantDomain = "example"
@@ -141,8 +161,9 @@ func TestCodeArtifactAssetConfiguration(t *testing.T) {
 		valid     bool
 	}{
 		{"no metadata rewrite URL", func(c *CodeArtifactConfig) { c.ProxyBaseURL = "" }, true},
-		{"repository still requires rewrite URL", func(c *CodeArtifactConfig) { c.AssetAPI = false; c.ProxyBaseURL = "" }, false},
-		{"requires aliases only", func(c *CodeArtifactConfig) { c.AliasesOnly = false }, false},
+		{"repository still requires rewrite URL", func(c *CodeArtifactConfig) { c.AssetAPI = false; c.Aliases = nil }, false},
+		{"rejects unused rewrite URL", func(c *CodeArtifactConfig) { c.ProxyBaseURL = "https://cachew.example.com" }, false},
+		{"rejects repository aliases", func(c *CodeArtifactConfig) { c.AssetAPI = false; c.ProxyBaseURL = "https://cachew.example.com" }, false},
 		{"requires aliases", func(c *CodeArtifactConfig) { c.Aliases = nil }, false},
 		{"rejects npm", func(c *CodeArtifactConfig) { c.Aliases[0].Path = "/npm/packages/{version}/{asset}" }, false},
 		{"rejects incomplete Maven path", func(c *CodeArtifactConfig) { c.Aliases[0].Path = "/maven/packages/{version}/{asset}" }, false},
@@ -150,7 +171,7 @@ func TestCodeArtifactAssetConfiguration(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			config := testCodeArtifactConfig("https://codeartifact.example.com")
-			config.AssetAPI, config.AliasesOnly = true, true
+			config.AssetAPI, config.ProxyBaseURL = true, ""
 			config.Aliases = []CodeArtifactAliasConfig{{Pattern: "/downloads/{version}/{asset}", Path: "/maven/packages/org/example/tool/{version}/{asset}"}}
 			tc.configure(&config)
 			_, err := newCodeArtifact(ctx, config, http.NewServeMux(), nil, cache.NoOpCache(), false)
