@@ -30,6 +30,7 @@ const (
 	testECRS3Host   = "prod-us-east-1-starport-layer-bucket.s3.us-east-1.amazonaws.com"
 	testECRName     = "ecr-public/buildkite/helm/agent-stack-k8s"
 	testOCIManifest = "application/vnd.oci.image.manifest.v1+json"
+	plainHTTP       = "http"
 )
 
 type fakeECR struct {
@@ -102,7 +103,7 @@ func (f *fakeECR) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		scheme := httpsScheme
 		if f.insecureS3 {
-			scheme = "http"
+			scheme = plainHTTP
 		}
 		http.Redirect(w, r, scheme+"://"+testECRS3Host+"/blob?X-Amz-Signature=presigned-secret", http.StatusTemporaryRedirect)
 	}
@@ -121,7 +122,7 @@ type pinTransport struct{ backend *httptest.Server }
 func (p pinTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	req = req.Clone(req.Context())
 	req.Host = req.URL.Host
-	req.URL.Scheme = "http"
+	req.URL.Scheme = plainHTTP
 	req.URL.Host = p.backend.Listener.Addr().String()
 	return http.DefaultTransport.RoundTrip(req) //nolint:wrapcheck // test transport
 }
@@ -223,10 +224,10 @@ func TestECRServesManifestsByDigestThenCaches(t *testing.T) {
 	w = e.do(http.MethodHead, "/"+testECRRegistry+"/v2/"+testECRName+"/manifests/"+digest)
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, digest, w.Header().Get("Docker-Content-Digest"))
-	assert.Equal(t, "hit", w.Header().Get("X-Cachew-Result"))
+	assert.Equal(t, cacheResultHit, w.Header().Get("X-Cachew-Result"))
 	assert.Equal(t, "", w.Header().Get(cache.ExpirationKey))
 	w = e.do(http.MethodGet, "/v2/"+testECRName+"/manifests/"+digest)
-	assert.Equal(t, "hit", w.Header().Get("X-Cachew-Result"))
+	assert.Equal(t, cacheResultHit, w.Header().Get("X-Cachew-Result"))
 	assert.Equal(t, "", w.Header().Get(cache.ExpirationKey))
 	registry, _ := e.fake.counts()
 	assert.Equal(t, 1, registry)
@@ -283,12 +284,12 @@ func TestECRHeadAnswersFromVerifiedCacheEntries(t *testing.T) {
 
 	w := e.do(http.MethodHead, "/v2/"+testECRName+"/blobs/"+digest)
 	assert.Equal(t, http.StatusOK, w.Code)
-	assert.Equal(t, "miss", w.Header().Get("X-Cachew-Result"))
+	assert.Equal(t, cacheResultMiss, w.Header().Get("X-Cachew-Result"))
 	assert.Equal(t, digest, w.Header().Get("Docker-Content-Digest"))
 	assert.Equal(t, 0, w.Body.Len())
 
 	w = e.do(http.MethodHead, "/v2/"+testECRName+"/blobs/"+digest)
-	assert.Equal(t, "hit", w.Header().Get("X-Cachew-Result"))
+	assert.Equal(t, cacheResultHit, w.Header().Get("X-Cachew-Result"))
 	_, s3 := e.fake.counts()
 	assert.Equal(t, 1, s3, "the second HEAD is answered from the cache entry's metadata")
 
@@ -481,7 +482,7 @@ func TestECROwnsTheUpstreamHeaders(t *testing.T) {
 
 	// The cache does not vary on the client's encoding.
 	w = e.do(http.MethodGet, "/v2/"+testECRName+"/blobs/"+testDigest(e.fake.blob))
-	assert.Equal(t, "hit", w.Header().Get("X-Cachew-Result"))
+	assert.Equal(t, cacheResultHit, w.Header().Get("X-Cachew-Result"))
 }
 
 func TestECRPropagatesMissingRepositoriesWithoutCaching(t *testing.T) {
