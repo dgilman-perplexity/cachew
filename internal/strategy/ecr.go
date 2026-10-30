@@ -45,6 +45,10 @@ const (
 	ecrManifests = "manifests"
 	ecrBlobs     = "blobs"
 
+	// Values of handler.CacheResultHeader.
+	cacheResultHit  = "hit"
+	cacheResultMiss = "miss"
+
 	// Every manifest type a digest can name, so ECR returns the stored bytes
 	// rather than negotiating a conversion that would not match the digest.
 	ecrManifestAccept = "application/vnd.oci.image.index.v1+json, " +
@@ -313,7 +317,7 @@ func (s *ECR) serveHead(w http.ResponseWriter, r *http.Request, ref ecrRef) {
 	key := cache.NewKey(ECRCacheKey(s.registry, ref.kind, ref.name, ref.digest))
 	options := httputil.ConditionalOptions(r)
 	headers, err := s.cache.Stat(r.Context(), key, options...)
-	result := "hit"
+	result := cacheResultHit
 	if errors.Is(err, os.ErrNotExist) {
 		fill := &statusRecorder{header: http.Header{}}
 		get := r.Clone(r.Context())
@@ -338,7 +342,7 @@ func (s *ECR) serveHead(w http.ResponseWriter, r *http.Request, ref ecrRef) {
 			// Verified, but the cache did not keep it (for example, over its size limit).
 			headers, err = fill.header, nil
 		}
-		result = "miss"
+		result = cacheResultMiss
 	}
 	headers = headers.Clone()
 	headers.Del(handler.CacheResultHeader)
