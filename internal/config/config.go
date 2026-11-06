@@ -37,9 +37,6 @@ func (l *loggingMux) HandleFunc(pattern string, handler func(http.ResponseWriter
 	l.mux.HandleFunc(pattern, handler)
 }
 
-// Handler exposes the mux's route lookup, so a strategy can detect a route
-// another block already registered and fail with a configuration error
-// rather than a ServeMux panic.
 func (l *loggingMux) Handler(r *http.Request) (http.Handler, string) {
 	return l.mux.Handler(r)
 }

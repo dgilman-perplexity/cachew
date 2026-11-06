@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -123,27 +124,16 @@ var (
 	errDigestFailed   = errors.New("digest mismatch")
 	errNoLength       = errors.New("registry response has no Content-Length")
 	errPartial        = errors.New("registry returned a 2xx other than 200")
-	errECRRejected    = errors.New("ECR rejected the proxy's credentials")
+	errECRRejected    = errors.New("ECR rejected the proxy's token (expired credentials, or a repository outside the role's scope)")
 	errECRTransport   = errors.New("ecr transport")
 	errECRRefresh     = errors.New("could not refresh ECR authorization")
 )
-
-// muxRouter is the route lookup *http.ServeMux offers (and the config
-// package's logging wrapper passes through), used to see whether another ecr
-// block already serves a path before mounting there.
-type muxRouter interface {
-	Handler(r *http.Request) (h http.Handler, pattern string)
-}
 
 // ecrRouteTaken reports whether mux already routes path to a handler mounted
 // at or below it, so a duplicate ecr block is a configuration error rather
 // than a ServeMux panic. A catch-all route above path does not count.
 func ecrRouteTaken(mux Mux, path string) bool {
-	router, ok := mux.(muxRouter)
-	if !ok {
-		return false
-	}
-	_, pattern := router.Handler(&http.Request{Method: http.MethodGet, URL: &url.URL{Path: path}})
+	_, pattern := mux.Handler(&http.Request{Method: http.MethodGet, URL: &url.URL{Path: path}})
 	return strings.HasPrefix(strings.TrimPrefix(pattern, http.MethodGet+" "), path)
 }
 
@@ -583,7 +573,7 @@ func (s *ECR) request(ctx context.Context, ref ecrRef, method string) (*http.Req
 		logging.FromContext(ctx).ErrorContext(ctx, "Failed to obtain ECR authorization", "error", err)
 		return nil, httputil.Errorf(http.StatusBadGateway, "could not obtain ECR authorization")
 	}
-	fetch := &ecrFetch{registry: s.registry, digest: ref.digest, token: token, strategy: s}
+	fetch := &ecrFetch{registry: s.registry, repository: ref.name, digest: ref.digest, token: token, strategy: s}
 	if ref.kind == ecrManifests {
 		fetch.accept = ecrManifestAccept
 		fetch.expiresAt = s.now().Add(s.manifestTTL)
@@ -612,6 +602,7 @@ func checkHTTPSRedirect(req *http.Request, via []*http.Request) error {
 // registry hop is the one a retry uses.
 type ecrFetch struct {
 	registry    string
+	repository  string
 	digest      string
 	accept      string
 	token       codeArtifactToken
@@ -667,11 +658,18 @@ func (t ecrTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 	if registryHop && ecrRejected(resp) {
-		// The proxy's own token or role failed. Clients are unauthenticated, so a
-		// 401 would read to them as a login problem on their side.
+		// The proxy's token or its role's scope is the cause, never the client's
+		// credentials (clients send none), so a 401 would read to them as a login
+		// problem on their side. Without repositories set, any client can cause
+		// one by naming a repository outside the role's scope, so only an
+		// allowlisted deployment, where that cannot happen, logs it as an error.
 		_ = resp.Body.Close()
-		logging.FromContext(req.Context()).ErrorContext(req.Context(), "ECR rejected the proxy's credentials",
-			"registry", fetch.registry, "status", resp.StatusCode)
+		level := slog.LevelWarn
+		if len(fetch.strategy.repositories) > 0 {
+			level = slog.LevelError
+		}
+		logging.FromContext(req.Context()).Log(req.Context(), level, errECRRejected.Error(),
+			"registry", fetch.registry, "repository", fetch.repository, "status", resp.StatusCode)
 		return nil, errors.Wrapf(errECRRejected, "status %d", resp.StatusCode)
 	}
 	if fetch.passthrough {

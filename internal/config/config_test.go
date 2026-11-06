@@ -387,7 +387,7 @@ func TestLoadRejectsConflictingECRBlocks(t *testing.T) {
 	}
 
 	err := load(a, b)
-	assert.Error(t, err, "two blocks cannot both own /v2/; the daemon's logging mux must expose route lookup")
+	assert.Error(t, err, "two blocks cannot both own /v2/")
 	assert.Contains(t, err.Error(), "prefix-only")
 
 	err = load(a, aPrefixOnly)
