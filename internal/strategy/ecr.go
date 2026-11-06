@@ -30,7 +30,8 @@ import (
 )
 
 const (
-	httpsScheme = "https"
+	ecrSchemeHTTPS = "https"
+	ecrUserAgent   = "cachew-ecr"
 
 	defaultECRManifestTTL       = 72 * time.Hour
 	defaultECRCredentialTimeout = 15 * time.Second
@@ -44,10 +45,6 @@ const (
 
 	ecrManifests = "manifests"
 	ecrBlobs     = "blobs"
-
-	// Values of handler.CacheResultHeader.
-	cacheResultHit  = "hit"
-	cacheResultMiss = "miss"
 
 	// Every manifest type a digest can name, so ECR returns the stored bytes
 	// rather than negotiating a conversion that would not match the digest.
@@ -74,8 +71,7 @@ func RegisterECR(r *Registry) {
 // ECRConfig configures one registry. In HCL:
 //
 //	ecr "123456789012.dkr.ecr.us-east-1.amazonaws.com" {
-//	  role-arn     = "arn:aws:iam::123456789012:role/cachew-ecr-read"
-//	  repositories = ["ecr-public/buildkite/"]
+//	  role-arn = "arn:aws:iam::123456789012:role/cachew-ecr-read"
 //	}
 //
 // mounts the registry at /v2/ and under /<registry>/v2/. Only manifests and
@@ -85,24 +81,26 @@ func RegisterECR(r *Registry) {
 type ECRConfig struct {
 	Registry            string        `hcl:"registry,label" help:"The ECR registry host, <account>.dkr.ecr.<region>.amazonaws.com."`
 	RoleARN             string        `hcl:"role-arn" help:"The read-only IAM role to assume for ECR pulls."`
-	Repositories        []string      `hcl:"repositories" help:"Repository names clients may read: an entry ending in / is a prefix, any other entry is one repository. Required; scope the role to the same repositories, since clients are unauthenticated."`
+	Repositories        []string      `hcl:"repositories,optional" help:"Repository names clients may read, as defense in depth on top of the role's IAM scope: an entry ending in / is a prefix, any other entry is one repository. Empty serves every repository the role can read."`
 	ManifestTTL         time.Duration `hcl:"manifest-ttl,optional" default:"72h" help:"How long a cached manifest is served. Keep it to days: cache hits never reach ECR, so lastRecordedPullTime goes stale and sinceImagePulled lifecycle rules could expire images still in use. Zero uses the default."`
 	CredentialTimeout   time.Duration `hcl:"credential-timeout,optional" default:"15s" help:"Maximum time to wait for ECR credential refresh, including a concurrent refresh. Zero uses the default."`
-	OriginHeaderTimeout time.Duration `hcl:"origin-header-timeout,optional" default:"60s" help:"Maximum time to wait for ECR or S3 response headers. A first pull through a pull-through rule imports the image before answering. Zero uses the default."`
+	OriginHeaderTimeout time.Duration `hcl:"origin-header-timeout,optional" default:"60s" help:"Maximum time to wait for ECR response headers. A first pull through a pull-through rule imports the image before answering. Zero uses the default."`
 	PrefixOnly          bool          `hcl:"prefix-only,optional" help:"Mount only under /<registry>/v2/. One ecr block can own the host root's /v2/; set this on the others."`
 }
 
-// The ECR [Strategy] serves GET and HEAD for /v2/<name>/manifests/<digest> and
-// /v2/<name>/blobs/<digest> from cache. Misses authenticate with a
-// GetAuthorizationToken token from an assumed role and follow ECR's signed
-// redirect to S3 for blobs. The body is hashed while it streams; a digest
-// mismatch aborts the cache write and truncates the response.
+// The ECR [Strategy] serves manifests from cache and hands blobs back to S3.
+// Manifest misses authenticate with a GetAuthorizationToken token from an
+// assumed role; the body is hashed while it streams, and a digest mismatch
+// aborts the cache write and truncates the response. A blob GET answers with
+// ECR's redirect to a presigned S3 URL and a blob HEAD with ECR's metadata, so
+// layers never stream through the proxy.
 type ECR struct {
 	registry     string
 	repositories []string
 	manifestTTL  time.Duration
 	tokens       codeArtifactTokenSource
-	client       *http.Client
+	client       *http.Client // manifests: follows redirects over https
+	blobClient   *http.Client // blobs: returns ECR's redirect unfollowed
 	cache        cache.Cache
 	handler      *handler.Handler
 	now          func() time.Time
@@ -125,7 +123,29 @@ var (
 	errDigestFailed   = errors.New("digest mismatch")
 	errNoLength       = errors.New("registry response has no Content-Length")
 	errPartial        = errors.New("registry returned a 2xx other than 200")
+	errECRRejected    = errors.New("ECR rejected the proxy's credentials")
+	errECRTransport   = errors.New("ecr transport")
+	errECRRefresh     = errors.New("could not refresh ECR authorization")
 )
+
+// muxRouter is the route lookup *http.ServeMux offers (and the config
+// package's logging wrapper passes through), used to see whether another ecr
+// block already serves a path before mounting there.
+type muxRouter interface {
+	Handler(r *http.Request) (h http.Handler, pattern string)
+}
+
+// ecrRouteTaken reports whether mux already routes path to a handler mounted
+// at or below it, so a duplicate ecr block is a configuration error rather
+// than a ServeMux panic. A catch-all route above path does not count.
+func ecrRouteTaken(mux Mux, path string) bool {
+	router, ok := mux.(muxRouter)
+	if !ok {
+		return false
+	}
+	_, pattern := router.Handler(&http.Request{Method: http.MethodGet, URL: &url.URL{Path: path}})
+	return strings.HasPrefix(strings.TrimPrefix(pattern, http.MethodGet+" "), path)
+}
 
 type ecrAuthorizationClient interface {
 	GetAuthorizationToken(
@@ -175,9 +195,6 @@ func validateECRConfig(config ECRConfig) (string, error) {
 	if !strings.HasPrefix(config.RoleARN, "arn:") {
 		return "", errors.Errorf("ecr %s: role-arn must be an IAM role ARN", config.Registry)
 	}
-	if len(config.Repositories) == 0 {
-		return "", errors.Errorf("ecr %s: repositories must list at least one repository or prefix", config.Registry)
-	}
 	for _, repository := range config.Repositories {
 		if !ecrRepositoryName.MatchString(strings.TrimSuffix(repository, "/")) {
 			return "", errors.Errorf("ecr %s: repositories entry %q is not a repository name or a prefix ending in /", config.Registry, repository)
@@ -218,14 +235,22 @@ func ecrTokenMinter(client ecrAuthorizationClient) originTokenMinter {
 }
 
 func newECR(config ECRConfig, tokens codeArtifactTokenSource, base http.RoundTripper, c cache.Cache, mux Mux) (*ECR, error) {
+	if ecrRouteTaken(mux, "/"+config.Registry+"/v2/") {
+		return nil, errors.Errorf("ecr %s: configured more than once", config.Registry)
+	}
+	if !config.PrefixOnly && ecrRouteTaken(mux, "/v2/") {
+		return nil, errors.Errorf("ecr %s: /v2/ is already mounted; set prefix-only on all but one ecr block", config.Registry)
+	}
+	transport := ecrTransport{base: base}
 	s := &ECR{
 		registry:     config.Registry,
 		repositories: config.Repositories,
 		manifestTTL:  config.ManifestTTL,
 		tokens:       tokens,
-		client: &http.Client{
-			Transport:     ecrTransport{base: base},
-			CheckRedirect: checkHTTPSRedirect,
+		client:       &http.Client{Transport: transport, CheckRedirect: checkHTTPSRedirect},
+		blobClient: &http.Client{
+			Transport:     transport,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 		cache: c,
 		now:   time.Now,
@@ -237,22 +262,16 @@ func newECR(config ECRConfig, tokens codeArtifactTokenSource, base http.RoundTri
 				// Unreachable: serve below rejects other paths first.
 				return ""
 			}
-			return ECRCacheKey(s.registry, ref.kind, ref.name, ref.digest)
+			return ECRCacheKey(s.registry, ref.name, ref.digest)
 		}).
 		Transform(func(r *http.Request) (*http.Request, error) {
 			ref, err := parseECRPath(r.PathValue("rest"))
 			if err != nil {
 				return nil, httputil.Errorf(http.StatusNotFound, "%s", err)
 			}
-			return s.request(r.Context(), ref)
+			return s.request(r.Context(), ref, http.MethodGet)
 		}).
-		TTL(func(r *http.Request) time.Duration {
-			ref, err := parseECRPath(r.PathValue("rest"))
-			if err != nil {
-				return 0
-			}
-			return s.ttl(ref.kind)
-		}).
+		TTL(func(*http.Request) time.Duration { return s.manifestTTL }).
 		OnError(writeECRError)
 	serve := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rest := r.PathValue("rest")
@@ -271,11 +290,15 @@ func newECR(config ECRConfig, tokens codeArtifactTokenSource, base http.RoundTri
 			http.Error(w, "repository is not served by this proxy", http.StatusNotFound)
 			return
 		}
+		if ref.kind == ecrBlobs {
+			s.serveBlob(w, r, ref)
+			return
+		}
 		// The upstream fetch is always identity-encoded, so the handler must
 		// not vary the cache key on what the client would have accepted.
 		r.Header.Del("Accept-Encoding")
 		if r.Method == http.MethodHead {
-			s.serveHead(w, r, ref)
+			s.serveManifestHead(w, r, ref)
 			return
 		}
 		s.handler.ServeHTTP(&hideExpiry{ResponseWriter: w}, r)
@@ -283,41 +306,87 @@ func newECR(config ECRConfig, tokens codeArtifactTokenSource, base http.RoundTri
 	// GET patterns also match HEAD. Clients such as go-containerregistry, Helm
 	// and Docker want the registry at the host root; containerd mirrors can use
 	// the prefix through override_path.
-	// The root goes first: if another ecr block owns it, nothing is mounted.
-	var patterns []string
 	if !config.PrefixOnly {
-		patterns = append(patterns, "GET /v2/{rest...}")
+		mux.Handle("GET /v2/{rest...}", serve)
 	}
-	patterns = append(patterns, "GET /"+config.Registry+"/v2/{rest...}")
-	if err := mountECR(mux, patterns, serve); err != nil {
-		return nil, errors.Wrapf(err, "ecr %s", config.Registry)
-	}
+	mux.Handle("GET /"+config.Registry+"/v2/{rest...}", serve)
 	return s, nil
 }
 
-// mountECR turns ServeMux's panic on a duplicate pattern, such as a second
-// ecr block without prefix-only, into a configuration error.
-func mountECR(mux Mux, patterns []string, h http.Handler) (err error) {
-	defer func() {
-		if conflict := recover(); conflict != nil {
-			err = errors.Errorf("conflicting routes (only one ecr block can omit prefix-only): %v", conflict)
-		}
-	}()
-	for _, pattern := range patterns {
-		mux.Handle(pattern, h)
+// serveBlob hands blob bytes back to S3. A GET answers with ECR's redirect to a
+// presigned S3 URL, which grants that one blob for a short time; a HEAD answers
+// with ECR's own length and digest. Clients verify blob digests themselves, and
+// Range and resumed downloads work against S3. Nothing is cached: the redirect
+// expires, and a blob pull needs ECR and S3 to be reachable.
+func (s *ECR) serveBlob(w http.ResponseWriter, r *http.Request, ref ecrRef) {
+	req, err := s.request(r.Context(), ref, r.Method)
+	if err != nil {
+		writeECRError(err, w, r)
+		return
 	}
-	return nil
+	resp, err := s.blobClient.Do(req)
+	if err != nil {
+		writeECRError(err, w, r)
+		return
+	}
+	defer func() {
+		// Drain a little so the connection to ECR can be reused.
+		io.CopyN(io.Discard, resp.Body, 2048) //nolint:errcheck,gosec // best effort
+		_ = resp.Body.Close()
+	}()
+	switch {
+	case r.Method == http.MethodGet && resp.StatusCode == http.StatusTemporaryRedirect:
+		raw := resp.Header.Get("Location")
+		location, err := url.Parse(raw)
+		if err != nil || location.Scheme != ecrSchemeHTTPS || location.Host == "" {
+			s.blobFailure(w, r, "ECR blob redirect is not an absolute https URL", resp.StatusCode)
+			return
+		}
+		// Copied verbatim: re-serializing could change the signed URL.
+		w.Header().Set("Location", raw)
+		// The presigned URL expires; it must not outlive it in any client cache.
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	case r.Method == http.MethodHead && resp.StatusCode == http.StatusOK:
+		if digest := resp.Header.Get("Docker-Content-Digest"); digest != ref.digest {
+			s.blobFailure(w, r, "ECR reported a different digest for the blob", resp.StatusCode)
+			return
+		}
+		if resp.ContentLength < 0 {
+			s.blobFailure(w, r, "ECR blob HEAD has no Content-Length", resp.StatusCode)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
+		w.Header().Set("Docker-Content-Digest", ref.digest)
+		w.WriteHeader(http.StatusOK)
+	case resp.StatusCode == http.StatusNotFound, resp.StatusCode == http.StatusTooManyRequests:
+		// Kept, as for manifests: a 404 lets mirror clients fall back to the
+		// next host, and a 429 tells them to back off.
+		if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+			w.Header().Set("Retry-After", retryAfter)
+		}
+		http.Error(w, http.StatusText(resp.StatusCode), resp.StatusCode)
+	default:
+		s.blobFailure(w, r, "unexpected ECR blob response", resp.StatusCode)
+	}
 }
 
-// serveHead answers HEAD from the cache entry's metadata. On a miss it first
-// fills the cache with a verified GET, so a HEAD never vouches for a digest
-// whose bytes have not been checked; for blobs that means a HEAD downloads the
-// blob once.
-func (s *ECR) serveHead(w http.ResponseWriter, r *http.Request, ref ecrRef) {
-	key := cache.NewKey(ECRCacheKey(s.registry, ref.kind, ref.name, ref.digest))
+// blobFailure logs the upstream status and answers 502. It never logs or echoes
+// the Location, which carries a presigned credential.
+func (s *ECR) blobFailure(w http.ResponseWriter, r *http.Request, reason string, status int) {
+	logging.FromContext(r.Context()).ErrorContext(r.Context(), reason, "registry", s.registry, "method", r.Method, "status", status)
+	http.Error(w, reason, http.StatusBadGateway)
+}
+
+// serveManifestHead answers a manifest HEAD from the cache entry's metadata. On
+// a miss it first fills the cache with a verified GET, so a HEAD never vouches
+// for a digest whose bytes have not been checked; manifests are small, and the
+// fill also performs a pull-through repository's first import.
+func (s *ECR) serveManifestHead(w http.ResponseWriter, r *http.Request, ref ecrRef) {
+	key := cache.NewKey(ECRCacheKey(s.registry, ref.name, ref.digest))
 	options := httputil.ConditionalOptions(r)
 	headers, err := s.cache.Stat(r.Context(), key, options...)
-	result := cacheResultHit
+	result := handler.CacheResultHit
 	if errors.Is(err, os.ErrNotExist) {
 		fill := &statusRecorder{header: http.Header{}}
 		get := r.Clone(r.Context())
@@ -342,7 +411,7 @@ func (s *ECR) serveHead(w http.ResponseWriter, r *http.Request, ref ecrRef) {
 			// Verified, but the cache did not keep it (for example, over its size limit).
 			headers, err = fill.header, nil
 		}
-		result = cacheResultMiss
+		result = handler.CacheResultMiss
 	}
 	headers = headers.Clone()
 	headers.Del(handler.CacheResultHeader)
@@ -356,7 +425,7 @@ func (s *ECR) serveHead(w http.ResponseWriter, r *http.Request, ref ecrRef) {
 }
 
 // statusRecorder discards a body and keeps the status and length, for the GET
-// a HEAD miss runs to fill the cache.
+// a manifest HEAD miss runs to fill the cache.
 type statusRecorder struct {
 	header  http.Header
 	status  int
@@ -420,9 +489,12 @@ func (w *hideExpiry) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (s *ECR) String() string { return "ecr:" + s.registry }
 
-// allowed reports whether a client may read the repository: clients are
-// unauthenticated, so this list, not the role, bounds what they reach.
+// allowed reports whether a client may read the repository. The role's IAM
+// scope is the boundary; a configured list narrows it further.
 func (s *ECR) allowed(name string) bool {
+	if len(s.repositories) == 0 {
+		return true
+	}
 	for _, repository := range s.repositories {
 		if strings.HasSuffix(repository, "/") {
 			if strings.HasPrefix(name, repository) {
@@ -435,12 +507,24 @@ func (s *ECR) allowed(name string) bool {
 	return false
 }
 
-// writeECRError answers with the error's status but never its URL: http.Client
-// wraps fetch failures in a url.Error naming the request URL, and after ECR's
-// redirect that is a presigned S3 URL carrying credentials.
+// writeECRError answers with the error's status but never a URL: http.Client
+// wraps fetch failures in a url.Error naming the request URL, and its own
+// errors can quote a raw Location, which may be a presigned S3 URL. Only this
+// strategy's errors, which name hosts alone, are echoed.
 func writeECRError(err error, w http.ResponseWriter, r *http.Request) {
+	for _, logged := range []error{errECRRejected, errECRRefresh} {
+		if errors.Is(err, logged) {
+			// The transport already logged it with its detail.
+			http.Error(w, logged.Error(), http.StatusBadGateway)
+			return
+		}
+	}
 	if urlErr, ok := errors.AsType[*url.Error](err); ok {
-		httputil.ErrorResponse(w, r, http.StatusBadGateway, fmt.Sprintf("fetch from ECR failed: %s", urlErr.Err))
+		msg := "fetch from ECR failed"
+		if ecrOwnError(urlErr.Err) {
+			msg = fmt.Sprintf("%s: %s", msg, urlErr.Err)
+		}
+		httputil.ErrorResponse(w, r, http.StatusBadGateway, msg)
 		return
 	}
 	if responder, ok := errors.AsType[httputil.HTTPResponder](err); ok {
@@ -450,20 +534,19 @@ func writeECRError(err error, w http.ResponseWriter, r *http.Request) {
 	httputil.ErrorResponse(w, r, http.StatusInternalServerError, err.Error())
 }
 
-// ECRCacheKey names a manifest or blob in the cache. The spaces keep it
-// disjoint from the URL-shaped keys other strategies write into the same
-// namespace.
-func ECRCacheKey(registry, kind, name, digest string) string {
-	return "ecr " + registry + " " + kind + " " + name + " " + digest
+func ecrOwnError(err error) bool {
+	for _, own := range []error{errTooManyHops, errInsecureHop, errDigestFailed, errNoLength, errPartial, errECRTransport} {
+		if errors.Is(err, own) {
+			return true
+		}
+	}
+	return false
 }
 
-// ttl keeps manifests short: their content never changes, but a cached
-// manifest hides pulls from ECR's lifecycle rules. Blobs use the cache maximum.
-func (s *ECR) ttl(kind string) time.Duration {
-	if kind == ecrManifests {
-		return s.manifestTTL
-	}
-	return 0
+// ECRCacheKey names a manifest in the cache. The spaces keep it disjoint from
+// the URL-shaped keys other strategies write into the same namespace.
+func ECRCacheKey(registry, name, digest string) string {
+	return "ecr manifest " + registry + " " + name + " " + digest
 }
 
 // servePing answers the distribution API version check without contacting
@@ -490,10 +573,10 @@ func parseECRPath(rest string) (ecrRef, error) {
 	return ecrRef{name: m[1], kind: m[2], digest: m[3]}, nil
 }
 
-// request returns the GET the handler executes. The request context carries the
-// token and expected digest for ecrTransport, which authenticates the registry
-// hop only and verifies the bytes on the final hop.
-func (s *ECR) request(ctx context.Context, ref ecrRef) (*http.Request, error) {
+// request returns the upstream request for ref. Its context carries the token
+// and expected digest for ecrTransport, which builds every header, sends the
+// token to the registry only, and verifies manifest bytes.
+func (s *ECR) request(ctx context.Context, ref ecrRef, method string) (*http.Request, error) {
 	token, err := s.tokens.Token(ctx, 0)
 	if err != nil {
 		// AWS errors name the role and account; log them, answer with the status.
@@ -502,15 +585,15 @@ func (s *ECR) request(ctx context.Context, ref ecrRef) (*http.Request, error) {
 	}
 	fetch := &ecrFetch{registry: s.registry, digest: ref.digest, token: token, strategy: s}
 	if ref.kind == ecrManifests {
+		fetch.accept = ecrManifestAccept
 		fetch.expiresAt = s.now().Add(s.manifestTTL)
+	} else {
+		fetch.passthrough = true
 	}
-	target := httpsScheme + "://" + s.registry + "/v2/" + ref.name + "/" + ref.kind + "/" + ref.digest
-	req, err := http.NewRequestWithContext(context.WithValue(ctx, ecrFetchKey{}, fetch), http.MethodGet, target, nil)
+	target := ecrSchemeHTTPS + "://" + s.registry + "/v2/" + ref.name + "/" + ref.kind + "/" + ref.digest
+	req, err := http.NewRequestWithContext(context.WithValue(ctx, ecrFetchKey{}, fetch), method, target, nil)
 	if err != nil {
 		return nil, httputil.Errorf(http.StatusInternalServerError, "create ECR request: %w", err)
-	}
-	if ref.kind == ecrManifests {
-		req.Header.Set("Accept", ecrManifestAccept)
 	}
 	return req, nil
 }
@@ -519,7 +602,7 @@ func checkHTTPSRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= 10 {
 		return errTooManyHops
 	}
-	if req.URL.Scheme != httpsScheme {
+	if req.URL.Scheme != ecrSchemeHTTPS {
 		return errors.Wrapf(errInsecureHop, "%s://%s", req.URL.Scheme, req.URL.Host)
 	}
 	return nil
@@ -528,12 +611,14 @@ func checkHTTPSRedirect(req *http.Request, via []*http.Request) error {
 // ecrFetch is shared by every hop of one fetch, so a token refreshed on the
 // registry hop is the one a retry uses.
 type ecrFetch struct {
-	registry  string
-	digest    string
-	token     codeArtifactToken
-	strategy  *ECR
-	retried   bool
-	expiresAt time.Time // zero for blobs
+	registry    string
+	digest      string
+	accept      string
+	token       codeArtifactToken
+	strategy    *ECR
+	retried     bool
+	passthrough bool      // blobs: serveBlob reads the status and headers
+	expiresAt   time.Time // zero for blobs
 }
 
 // allowForcedRefresh reports whether a rejection may mint a new token now.
@@ -548,13 +633,12 @@ func (s *ECR) allowForcedRefresh() bool {
 
 type ecrFetchKey struct{}
 
-// ecrTransport owns every header that reaches ECR and S3. The shared handler
-// forwards the client's headers onto the upstream request, so the client's
-// Authorization, Range and conditional headers are dropped here and
-// Accept-Encoding is pinned to identity: the digest is over the stored bytes,
-// not a transfer encoding. ECR's credentials go on the registry hop only;
-// http.Client keeps the request context across ECR's redirect to S3, so the
-// digest check lands on the final hop.
+// ecrTransport builds every header that reaches ECR from scratch. The shared
+// handler and http.Client's redirects copy the client's headers onto upstream
+// requests, and S3 rejects a presigned URL with any unsigned X-Amz-* header, so
+// none of them pass: only Accept for manifests, Accept-Encoding pinned to
+// identity (the digest is over the stored bytes), a fixed User-Agent, and
+// ECR's credentials on the registry hop only.
 type ecrTransport struct {
 	base http.RoundTripper
 }
@@ -562,12 +646,12 @@ type ecrTransport struct {
 func (t ecrTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	fetch, isFetch := req.Context().Value(ecrFetchKey{}).(*ecrFetch)
 	req = req.Clone(req.Context())
-	for _, name := range []string{"Authorization", "Range", "If-Range", "If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since"} {
-		req.Header.Del(name)
-	}
-	req.Header.Set("Accept-Encoding", "identity")
+	req.Header = http.Header{"Accept-Encoding": {"identity"}, "User-Agent": {ecrUserAgent}}
 	if !isFetch {
 		return t.roundTrip(req)
+	}
+	if fetch.accept != "" {
+		req.Header.Set("Accept", fetch.accept)
 	}
 	registryHop := req.URL.Host == fetch.registry
 	if registryHop {
@@ -577,15 +661,25 @@ func (t ecrTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	rejected := resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden
-	if registryHop && rejected && !fetch.retried {
+	if registryHop && ecrRejected(resp) && !fetch.retried {
 		if resp, err = t.retryRejected(req, resp, fetch); err != nil {
 			return nil, err
 		}
 	}
+	if registryHop && ecrRejected(resp) {
+		// The proxy's own token or role failed. Clients are unauthenticated, so a
+		// 401 would read to them as a login problem on their side.
+		_ = resp.Body.Close()
+		logging.FromContext(req.Context()).ErrorContext(req.Context(), "ECR rejected the proxy's credentials",
+			"registry", fetch.registry, "status", resp.StatusCode)
+		return nil, errors.Wrapf(errECRRejected, "status %d", resp.StatusCode)
+	}
+	if fetch.passthrough {
+		return resp, nil
+	}
 	switch {
 	case resp.StatusCode >= 300 && resp.StatusCode < 400 && registryHop:
-		// ECR's redirect to S3; http.Client follows it.
+		// A redirect; http.Client follows it over https only.
 		return resp, nil
 	case resp.StatusCode >= 200 && resp.StatusCode < 300 && resp.StatusCode != http.StatusOK:
 		_ = resp.Body.Close()
@@ -594,6 +688,10 @@ func (t ecrTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return withoutUpstreamDetail(req.Context(), req.URL.Host, resp), nil
 	}
 	return verifyECRResponse(req, resp, fetch)
+}
+
+func ecrRejected(resp *http.Response) bool {
+	return resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden
 }
 
 // retryRejected retries a rejected registry request once with a newer token:
@@ -609,7 +707,7 @@ func (t ecrTransport) retryRejected(req *http.Request, resp *http.Response, fetc
 	if err != nil {
 		_ = resp.Body.Close()
 		logging.FromContext(req.Context()).ErrorContext(req.Context(), "Failed to refresh ECR authorization", "error", err)
-		return nil, errors.New("could not refresh ECR authorization")
+		return nil, errECRRefresh
 	}
 	if refreshed.generation == fetch.token.generation {
 		return resp, nil
@@ -620,17 +718,18 @@ func (t ecrTransport) retryRejected(req *http.Request, resp *http.Response, fetc
 	return t.roundTrip(req)
 }
 
-// verifyECRResponse wraps a 200 body in the digest verifier and sets the
-// headers this strategy owns.
+// verifyECRResponse wraps a manifest body in the digest verifier and sets the
+// headers this strategy owns. Errors name the host only: the path can carry
+// the registry's account.
 func verifyECRResponse(req *http.Request, resp *http.Response, fetch *ecrFetch) (*http.Response, error) {
 	expected := strings.TrimPrefix(fetch.digest, "sha256:")
 	switch {
 	case resp.ContentLength < 0:
 		_ = resp.Body.Close()
-		return nil, errors.Wrapf(errNoLength, "%s%s", req.URL.Host, req.URL.Path)
+		return nil, errors.Wrapf(errNoLength, "%s", req.URL.Host)
 	case resp.ContentLength == 0 && expected != emptySHA256:
 		_ = resp.Body.Close()
-		return nil, errors.Wrapf(errDigestFailed, "%s%s returned an empty body for sha256:%s", req.URL.Host, req.URL.Path, expected)
+		return nil, errors.Wrapf(errDigestFailed, "%s returned an empty body for sha256:%s", req.URL.Host, expected)
 	}
 	resp.Body = &digestVerifyingBody{ReadCloser: resp.Body, hash: sha256.New(), expected: expected}
 	// ECR sends this on HEAD but not on GET for manifests; clients that verify
@@ -656,7 +755,11 @@ func withoutUpstreamDetail(ctx context.Context, host string, resp *http.Response
 	logging.FromContext(ctx).DebugContext(ctx, "ECR returned an error",
 		"status", resp.StatusCode, "host", host, "body", string(detail), "read_error", readErr)
 	body := http.StatusText(resp.StatusCode) + "\n"
+	retryAfter := resp.Header.Get("Retry-After")
 	resp.Header = http.Header{"Content-Type": {"text/plain; charset=utf-8"}}
+	if retryAfter != "" {
+		resp.Header.Set("Retry-After", retryAfter)
+	}
 	resp.Body = io.NopCloser(strings.NewReader(body))
 	resp.ContentLength = int64(len(body))
 	return resp
@@ -666,7 +769,7 @@ func (t ecrTransport) roundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.base.RoundTrip(req) //nolint:bodyclose // the caller owns resp.Body
 	if err != nil {
 		// Name the host only: presigned S3 URLs carry credentials.
-		return nil, errors.Wrapf(err, "ecr transport: %s", req.URL.Host)
+		return nil, errors.Errorf("%w: %s: %w", errECRTransport, req.URL.Host, err)
 	}
 	return resp, nil
 }
@@ -676,7 +779,7 @@ func (t ecrTransport) roundTrip(req *http.Request) (*http.Response, error) {
 // returned as a read error with those bytes still unsent, so the handler
 // aborts the cache entry and the client sees a truncated response rather than
 // a complete wrong one. That truncation relies on the upstream Content-Length
-// the handler copied to the client; ECR and S3 send it.
+// the handler copied to the client; ECR sends it.
 type digestVerifyingBody struct {
 	io.ReadCloser
 	hash     hash.Hash
@@ -717,7 +820,8 @@ func (b *digestVerifyingBody) Read(p []byte) (int, error) {
 		release -= digestHoldback
 	}
 	n := copy(p, b.held[:release])
-	b.held = b.held[n:]
+	// Shift in place so the next append reuses the buffer instead of growing it.
+	b.held = append(b.held[:0], b.held[n:]...)
 	if b.verified && len(b.held) == 0 {
 		return n, io.EOF
 	}
